@@ -348,6 +348,30 @@ Common conventions:
   transparently opens the LUKS device (again, closed on exit).
 - **`options` keys**, where present, are space-separated argument lists passed
   through to the underlying tool.
+- **`when` key (optional, any action type)** makes an action conditional. When
+  the predicate is false the action is skipped entirely — it is not validated,
+  not sanity-checked, and not executed, and any devices it would have created
+  are not registered. This lets a shared config (e.g. one pulled in via
+  `[include ...]`) contain an action that should only run in some variants
+  (for example a `crypttab` action that only applies when LUKS was used). The
+  predicate grammar is:
+
+  | Predicate            | True when… |
+  | -------------------- | ---------- |
+  | `type:<type>`        | any `[action.<type>.<instance>]` section exists. |
+  | `section:<name>`     | a section named `<name>` exists. |
+  | `true` / `false`     | always true / always false. |
+  | `%varname%` (or any value) | expanded (leniently); true if the result is non-empty and not `false`/`0`/`no`/`off`. `[var.*]` values are resolved before validation; not-yet-collected `userinput` answers are treated as true at validation time and re-evaluated at run time. |
+  | `!<predicate>`       | negation of any of the above. |
+
+  Example: only write `/etc/crypttab` when the setup created a LUKS device:
+  ```ini
+  [action.crypttab.root]
+  when     = type:crypt
+  target   = ext4.system
+  drives   = crypt.root
+  remember = true
+  ```
 
 ### `action.wipe`
 
@@ -766,6 +790,12 @@ The UUID is resolved with `blkid` from the `drive` of each referenced
 The file is written fresh (any pre-existing `/etc/crypttab` in the target is
 overwritten). Place this action before any `action.updateinitramfs` so the
 initramfs regenerated afterwards picks up the crypttab.
+
+If you split your recipe across includes (e.g. a *setup* snippet that may or
+may not create LUKS devices, and a shared *config* snippet containing the
+`crypttab` action), gate it with `when = type:crypt` so it is skipped — and
+not even validated — when no `[action.crypt.*]` section is present. See the
+`when` key under *Common conventions* above.
 
 #### Example
 

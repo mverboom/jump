@@ -978,6 +978,13 @@ validate_config() {
       local suffix="${section#action.}"
       local type="${suffix%%.*}"
 
+      # Skip inactive (when=false) actions entirely: their references are
+      # not validated, so a gated action may name devices/sections that
+      # only exist in another variant of the config.
+      if ! is_action_active "$section"; then
+         continue
+      fi
+
       if declare -F "validate_action_${type}" &>/dev/null; then
          validate_action_"${type}" "$section" || ((errors++))
       else
@@ -1327,6 +1334,84 @@ get_value() {
    else
       return 1
    fi
+}
+
+# Evaluate a `when` predicate used to make an action conditional.
+# Predicate grammar (whitespace is not trimmed around the value):
+#   !PRED          negation
+#   type:<type>    true if any [action.<type>.<instance>] section exists
+#   section:<name> true if a section named <name> exists
+#   true | false   constant
+#   <other>        treated as a value: %...% references are expanded
+#                  (leniently, so references not yet resolvable — e.g. an
+#                  uncollected userinput answer during validation — are left
+#                  verbatim) and the predicate is true if the result is
+#                  non-empty and not one of {false, 0, no, off} (case-
+#                  insensitive). A verbatim leftover %ref% counts as true so
+#                  the action is still validated; the real skip decision is
+#                  made again at run time when answers are available.
+# Parameters: $1 - predicate string
+# Returns: 0 if the predicate is true, 1 if false
+eval_when_predicate() {
+   local pred="$1"
+   local negate=false
+   if [[ "$pred" == !* ]]; then
+      negate=true
+      pred="${pred#!}"
+   fi
+
+   local result=false
+   case "$pred" in
+      type:*)
+         local t="${pred#type:}"
+         local s
+         for s in "${SECTIONS[@]}"; do
+            if [[ "$s" == "action.${t}."* ]]; then
+               result=true
+               break
+            fi
+         done
+         ;;
+      section:*)
+         if has_section "${pred#section:}"; then
+            result=true
+         fi
+         ;;
+      true)
+         result=true ;;
+      false)
+         result=false ;;
+      *)
+         local val low
+         expand_prompt "$pred"; val="$_expand_value_result"
+         low="${val,,}"
+         if [[ -n "$val" ]] && [[ "$low" != "false" ]] && \
+            [[ "$low" != "0" ]] && [[ "$low" != "no" ]] && \
+            [[ "$low" != "off" ]]; then
+            result=true
+         fi
+         ;;
+   esac
+
+   if [[ "$negate" == true ]]; then
+      if [[ "$result" == true ]]; then result=false; else result=true; fi
+   fi
+
+   if [[ "$result" == true ]]; then return 0; else return 1; fi
+}
+
+# Decide whether an action section is active (should be validated/run) based
+# on its optional `when` key. Actions without `when` are always active.
+# Parameters: $1 - section name
+# Returns: 0 if active, 1 if inactive (should be skipped)
+is_action_active() {
+   local section="$1"
+   if ! has_key "$section" "when"; then
+      return 0
+   fi
+   local pred
+   pred="$(get_value "$section" "when")"
+   eval_when_predicate "$pred"
 }
 
 # Check if a variable name is defined by a [userinput.*] section.
@@ -3126,6 +3211,14 @@ collect_action_devices() {
    ACTION_DEVICES=()
 
    for section in "${SECTIONS[@]}"; do
+      if [[ "$section" != action.* ]]; then
+         continue
+      fi
+      # Don't register devices for inactive (when=false) actions; they won't
+      # be created, so later sanity checks must not treat them as action devices.
+      if ! is_action_active "$section"; then
+         continue
+      fi
       if [[ "$section" == action.md.* ]]; then
          if has_key "$section" "device"; then
             local device
@@ -3197,6 +3290,11 @@ sanity_check() {
             netinterface) sanity_check_netinterface "$section" || ((failed++)) ;;
          esac
       elif [[ "$section" == action.* ]]; then
+         # Skip inactive (when=false) actions; their dependencies may not
+         # exist on this hardware and they won't run anyway.
+         if ! is_action_active "$section"; then
+            continue
+         fi
          dispatch_action sanity_check "$section" || ((failed++))
       fi
    done
@@ -3470,7 +3568,10 @@ run_actions() {
       if [[ "$section" != action.* ]]; then
          continue
       fi
-
+      if ! is_action_active "$section"; then
+         log "Skipping [${section}] (when condition is false)"
+         continue
+      fi
       dispatch_action run_action "$section"
    done
 }
@@ -6319,6 +6420,9 @@ confirm_destructive_actions() {
       if [[ "$section" != action.wipe.* ]]; then
          continue
       fi
+      if ! is_action_active "$section"; then
+         continue
+      fi
 
       local drives_val
       drives_val="$(get_value "$section" "drives")"
@@ -6346,7 +6450,7 @@ confirm_destructive_actions() {
 run_actions_with_progress() {
    local total=0 section
    for section in "${SECTIONS[@]}"; do
-      [[ "$section" == action.* ]] && ((total++))
+      [[ "$section" == action.* ]] && is_action_active "$section" && ((total++))
    done
    if [[ "$total" -eq 0 ]]; then
       die "no actions to execute"
@@ -6356,6 +6460,10 @@ run_actions_with_progress() {
 
    for section in "${SECTIONS[@]}"; do
       if [[ "$section" != action.* ]]; then
+         continue
+      fi
+      if ! is_action_active "$section"; then
+         log "Skipping [${section}] (when condition is false)"
          continue
       fi
 
@@ -6834,7 +6942,11 @@ print_config_summary() {
       elif [[ "$section" == action.* ]]; then
          suffix="${section#action.}"
          type="${suffix%%.*}"
-         printf '%s\n' "  [$section] type=${type}"
+         local marker=""
+         if ! is_action_active "$section"; then
+            marker=" [inactive]"
+         fi
+         printf '%s\n' "  [$section] type=${type}${marker}"
       else
          printf '%s\n' "  [$section]"
       fi
