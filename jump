@@ -6112,6 +6112,9 @@ run_action_wipe() {
    for drive in "${drives[@]}"; do
       log "Wiping ${drive}..."
 
+      # Erase LUKS headers (and close mappings) BEFORE the partition table is
+      # zapped, while the LUKS partitions still exist to be enumerated.
+      wipe_luks "${drive}"
       wipe_partition_table "${drive}"
       wipe_zfs "${drive}"
       wipe_lvm "${drive}"
@@ -6230,6 +6233,58 @@ wipe_lvm() {
          run_cmd_allow_fail pvremove -ff --yes "$pv"
       fi
    done <<< "$lvm_output"
+}
+
+# Close open LUKS mappings on a drive and erase LUKS headers so a later
+# zpool/mkfs create does not refuse a device with "contains a filesystem of
+# type 'crypto_LUKS'" when re-initializing a disk that previously held LUKS.
+# Mirrors wipe_zfs/wipe_lvm. The dd fallback works without cryptsetup (a config
+# with no crypt actions, and thus possibly no cryptsetup installed, may still
+# need to wipe a previously-LUKS disk).
+# Parameters: $1 - device path
+wipe_luks() {
+   local dev="$1"
+   local real_dev
+   real_dev="$(readlink -f "$dev")"
+
+   # Close any open crypt mappings whose backing device is on this drive, so
+   # the underlying partition can be overwritten. Only if cryptsetup present.
+   if command -v cryptsetup &>/dev/null; then
+      local line nm ty pk
+      while IFS= read -r line; do
+         [[ -z "$line" ]] && continue
+         read -r nm ty pk <<< "$line"
+         [[ "$ty" == "crypt" ]] || continue
+         log "Closing open LUKS mapping ${nm} on ${dev}"
+         run_cmd_allow_fail --stdin /dev/null -- cryptsetup luksClose "$nm"
+      done <<< "$(lsblk -no NAME,TYPE,PKNAME "$dev" 2>/dev/null)"
+   fi
+
+   # Build the list of LUKS-header locations to check: the whole drive plus
+   # each of its partitions (whole-disk LUKS vs. partition LUKS).
+   local -a targets=("$dev")
+   local line p ty
+   while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      read -r p ty <<< "$line"
+      [[ "$ty" == "part" ]] && targets+=("$p")
+   done <<< "$(lsblk -no PATH,TYPE "$dev" 2>/dev/null | tail -n +2)"
+
+   local t fstype
+   for t in "${targets[@]}"; do
+      [[ -e "$t" ]] || continue
+      fstype="$(lsblk -ndo FSTYPE "$t" 2>/dev/null)"
+      # crypto_LUKS (LUKS1) and crypto_LUKS2 both start with this prefix.
+      [[ "$fstype" == crypto_LUKS* ]] || continue
+      log "Wiping LUKS header on ${t}"
+      if command -v cryptsetup &>/dev/null; then
+         run_cmd_allow_fail --stdin /dev/null -- \
+            cryptsetup erase --batch-mode "$t"
+      fi
+      # Guarantee the header bytes are gone without cryptsetup: the default
+      # LUKS2 header (header + JSON + keyslots) occupies the first 16 MiB.
+      run_cmd_allow_fail dd if=/dev/zero of="$t" bs=1M count=16 conv=notrunc
+   done
 }
 
 # Wipe the partition table and ZFS label areas on a device.
