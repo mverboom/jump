@@ -330,17 +330,22 @@ unambiguous). Actions run in the order they appear in the file.
 
 Supported types, in their canonical order:
 
-`wipe`, `partition`, `zpool`, `zfs`, `extract`, `file`, `filemodify`, `ext4`,
+`wipe`, `partition`, `crypt`, `zpool`, `zfs`, `extract`, `file`, `filemodify`, `ext4`,
 `vfat`, `swap`, `efibootmgr`, `password`, `sshhostkeys`, `mkdir`,
-`netifrename`, `md`, `mdadm`, `updateinitramfs`, `authorizedkeys`.
+`netifrename`, `md`, `mdadm`, `crypttab`, `updateinitramfs`, `authorizedkeys`.
 
 Common conventions:
 
 - **Drive references** (`drive` keys) accept either a `%varname[idx]part%`
-  reference (must include a partition number where required) or a literal
-  device path such as `/dev/sda1`.
+  reference (must include a partition number where required), a literal
+  device path such as `/dev/sda1`, or a **crypt back-reference**
+  `crypt.<instance>` naming an earlier `[action.crypt.<instance>]` section
+  (see `action.crypt` below). The LUKS device is opened lazily the first time
+  it is referenced and closed on exit (like MD arrays).
 - **`target` keys** reference an earlier `zfs`/`ext4`/`vfat` action as
-  `<type>.<instance>` (see *Reference syntax* › Target references).
+  `<type>.<instance>` (see *Reference syntax* › Target references). If that
+  filesystem was created on a `crypt.<instance>` device, mounting it
+  transparently opens the LUKS device (again, closed on exit).
 - **`options` keys**, where present, are space-separated argument lists passed
   through to the underlying tool.
 
@@ -380,6 +385,41 @@ drives  = %targetdisks%
 type    = gpt
 part-1  = 512MB EF00
 part-2  = remain 8300
+```
+
+### `action.crypt`
+
+Create a LUKS-encrypted device with `cryptsetup luksFormat`. The instance
+name is the **mapper name** the device will be opened as
+(`/dev/mapper/<instance>`). The device is **not** opened by this action; it is
+opened lazily the first time a later action references it via a
+`crypt.<instance>` drive back-reference, and closed again on exit (like MD
+arrays created by `action.md`).
+
+| Key         | Required | Description |
+| ----------- | -------- | ----------- |
+| `drive`     | yes      | The underlying device to encrypt: a `%varname[idx]part%` reference (with partition) or a literal path such as `/dev/sda2`. A whole-drive reference (no partition) is also accepted. |
+| `passphrase` | yes     | The LUKS passphrase. **Must contain at least one `%variable%` reference** (typically a `userinput.password` variable), like `action.password` — a literal passphrase is a validation error. It is fed to `cryptsetup` via a temporary key-file, so it never appears in `argv` or logs. |
+| `options`   | no       | Space-separated extra arguments passed to `cryptsetup luksFormat` (after `--key-file`), e.g. `--type luks2 --cipher aes-xts-plain64`. |
+
+Other actions can target the encrypted device by using `crypt.<instance>`
+wherever a `drive` is accepted (`ext4`/`vfat`/`swap`, `zpool` `vdev`, `md`
+member `drives`, and `efibootmgr` single-`drive`). At runtime `jump` runs
+`cryptsetup luksOpen` on first use and substitutes `/dev/mapper/<instance>`;
+any `ext4`/`vfat`/`zfs` action created on the mapper may then be used as a
+normal `target` by later actions.
+
+#### Example
+
+```ini
+[action.crypt.root]
+drive      = %targetdisks[0]2%
+passphrase = %luks_passphrase%
+options    = --type luks2
+
+[action.ext4.system]
+drive = crypt.root
+label = system
 ```
 
 ### `action.zpool`
@@ -698,6 +738,44 @@ assembles the same arrays on boot.
 target = ext4.system
 ```
 
+### `action.crypttab`
+
+Write `/etc/crypttab` onto a target filesystem so the installed system opens
+the same LUKS devices at boot. One line is written per referenced crypt
+instance, in the form:
+
+```
+<instance>  UUID=<uuid>  none  <options>
+```
+
+The UUID is resolved with `blkid` from the `drive` of each referenced
+`[action.crypt.<instance>]` section. The `keyfile` field is always `none`
+(passphrase prompted at boot). The `options` field depends on `remember`:
+
+- `remember = false` (default): `luks,discard`
+- `remember = true`: `luks,discard,initramfs,keyscript=decrypt_keyctl` —
+  used when several devices share the same passphrase so it only has to be
+  entered once during early boot.
+
+| Key       | Required | Description |
+| --------- | -------- | ----------- |
+| `target`  | yes      | Target reference (the root filesystem where `/etc/crypttab` is created). |
+| `drives`  | yes      | Space-separated list of `crypt.<instance>` back-references; each must match an existing `[action.crypt.<instance>]` section. |
+| `remember` | no      | `true` or `false` (default `false`). See the options field above. |
+
+The file is written fresh (any pre-existing `/etc/crypttab` in the target is
+overwritten). Place this action before any `action.updateinitramfs` so the
+initramfs regenerated afterwards picks up the crypttab.
+
+#### Example
+
+```ini
+[action.crypttab.root]
+target   = ext4.system
+drives   = crypt.root crypt.swap
+remember = true
+```
+
 ### `action.updateinitramfs`
 
 Mount the target root filesystem, optionally mount additional filesystems
@@ -989,3 +1067,88 @@ In this example `%disksize:1TB%` selects both ~1 TB disks (the reference returns
 all matching disks), `targetdisks` is trimmed to the required 2, and the
 mirrored EFI entries are created on both disks with per-drive labels via
 `%drive%`.
+
+### Example 3 — interactive single-disk LUKS + ext4 + UEFI
+
+A single SSD with an unencrypted EFI System Partition and an encrypted root
+filesystem. Save as `crypthost.cfg` and run with `jump crypthost.cfg`.
+
+```ini
+[global]
+description = Debian 12 host, LUKS-encrypted root (interactive)
+
+[var.arch]
+value = amd64
+
+[var.rootfs_url]
+value = http://boot.example.com/images/debian-12-rootfs-%arch%.tar.zst
+
+[userinput.drives.target]
+variable = targetdisks
+prompt   = Select the SSD to install onto
+number   = 1
+
+[userinput.password.luks]
+variable = luks_pass
+prompt   = LUKS passphrase for the root device
+
+[userinput.password.rootpw]
+variable = rootpw
+prompt   = Root password for the new system
+
+[userinput.generic.hostname]
+variable = hostname
+prompt   = Hostname for the new system
+length   = 63
+
+[action.wipe.everything]
+drives = %targetdisks%
+
+[action.partition.main]
+drives  = %targetdisks%
+type    = gpt
+part-1  = 512MB EF00
+part-2  = remain 8300
+
+[action.crypt.root]
+drive      = %targetdisks[0]2%
+passphrase = %luks_pass%
+
+[action.vfat.efi]
+drive = %targetdisks[0]1%
+label = EFI
+
+[action.ext4.system]
+drive = crypt.root
+label = system
+
+[action.extract.rootfs]
+source = %rootfs_url%
+target = ext4.system
+
+[action.file.hostname]
+target  = ext4.system
+file    = /etc/hostname
+content = %hostname%
+
+[action.password.root]
+target   = ext4.system
+user     = root
+password = %rootpw%
+
+[action.crypttab.root]
+target   = ext4.system
+drives   = crypt.root
+remember = false
+
+[action.updateinitramfs.root]
+target = ext4.system
+mount1 = vfat.efi /boot/efi
+```
+
+The `ext4.system` filesystem is created on the LUKS mapper `/dev/mapper/root`;
+`jump` runs `cryptsetup luksOpen root` on first reference (the `ext4` action)
+and `cryptsetup luksClose root` on exit. `crypttab.root` writes
+`root UUID=… none luks,discard` so the installed system prompts for the
+passphrase at boot, then `updateinitramfs` regenerates the initramfs with
+`cryptsetup` support.

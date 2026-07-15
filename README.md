@@ -93,8 +93,9 @@ provided by you and referenced from the configuration.
 - `curl`, `lsblk`, and `tar` are always required.
 - `whiptail` is required for interactive mode.
 - Action-specific tools are required only when the corresponding action is
-  used: `sgdisk`/`sfdisk` (partitioning), `zpool`/`zfs` (ZFS),
-  `mkfs.ext4`/`mkfs.vfat`/`mkswap` (filesystems), `efibootmgr` (EFI entries),
-  `openssl` (passwords), `ssh-keygen` (SSH host keys), `mdadm` (MD RAID),
+  used: `sgdisk`/`sfdisk` (partitioning), `cryptsetup` (LUKS),
+  `zpool`/`zfs` (ZFS), `mkfs.ext4`/`mkfs.vfat`/`mkswap` (filesystems),
+  `efibootmgr` (EFI entries), `openssl` (passwords), `ssh-keygen` (SSH host
+  keys), `mdadm` (MD RAID), `blkid` (crypttab UUIDs),
   `chroot` + `update-initramfs` (initramfs refresh). `jump` checks for these
   at runtime and reports what is missing.

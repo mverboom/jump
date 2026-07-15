@@ -17,6 +17,11 @@ declare -A IMPORTED_POOL_MOUNTPOINTS=()
 declare -a TEMP_FILES=()
 declare -a TEMP_DIRS=()
 declare -A ACTION_DEVICES=()
+# LUKS instances opened during the run (instance name → mapper /dev/mapper/<name>).
+# CREATED_CRYPT_DEVICES preserves open order so they can be closed on exit;
+# OPENED_CRYPT is an idempotency guard for ensure_crypt_open.
+declare -a CREATED_CRYPT_DEVICES=()
+declare -A OPENED_CRYPT=()
 
 # Ordered list of action types; iteration order = execution order.
 # Adding a new action type: add it here, add its ACTION_DESCRIPTIONS entry,
@@ -24,9 +29,9 @@ declare -A ACTION_DEVICES=()
 # The dispatch helper below picks the right one.
 # shellcheck disable=SC2034 # accessed indirectly via loop in action_description
 readonly -a ACTION_TYPES=(
-   wipe partition zpool zfs extract file filemodify ext4 vfat swap \
-   efibootmgr password sshhostkeys mkdir netifrename md mdadm updateinitramfs \
-   authorizedkeys
+   wipe partition crypt zpool zfs extract file filemodify ext4 vfat swap \
+   efibootmgr password sshhostkeys mkdir netifrename md mdadm crypttab \
+   updateinitramfs authorizedkeys
 )
 
 # Per-action-type description template, indexed by ACTION_TYPES. The string
@@ -36,6 +41,7 @@ readonly -a ACTION_TYPES=(
 readonly -a ACTION_DESCRIPTIONS=(
    'Wiping drives (%s)'
    'Partitioning drives (%s)'
+   'Creating LUKS device (%s)'
    'Creating ZFS pool "%s"'
    '__zfs__'
    'Extracting "%s"'
@@ -51,6 +57,7 @@ readonly -a ACTION_DESCRIPTIONS=(
    'Renaming network interface (%s)'
    'Creating MD RAID device (%s)'
    'Creating mdadm.conf (%s)'
+   'Writing /etc/crypttab (%s)'
    'Updating initramfs (%s)'
    'Adding authorized_keys entry (%s)'
 )
@@ -362,7 +369,7 @@ process_includes() {
 # when the initial configuration was fetched from a URL.
 # - starturl: the base URL (URL without the filename) — e.g. http://example.com/js/
 # - startbaseurl: the URL up to and including the host — e.g. http://example.com
-# For example, if the config was fetched from http://example.com/js/jumpstart,
+# For example, if the config was fetched from http://example.com/js/jump,
 #   starturl     = http://example.com/js/
 #   startbaseurl = http://example.com
 # Parameters: $1 - config file path
@@ -385,7 +392,7 @@ inject_starturl() {
 
    # Compute startbaseurl: extract the scheme://host part
    # Remove the path portion after the host. Handles hostnames with ports.
-   # e.g. http://example.com:8080/js/jumpstart -> http://example.com:8080
+   # e.g. http://example.com:8080/js/jump -> http://example.com:8080
    local startbaseurl
    startbaseurl="$(echo "$config_url" | sed -E 's#^(https?://[^/]+).*$#\1#')"
 
@@ -1199,6 +1206,18 @@ validate_action_zpool() {
                ((valid++))
             fi
          done <<< "$refs"
+
+         # Validate crypt.<instance> back-reference tokens. These are literal
+         # tokens (not %...% references) so extract_references skips them; scan
+         # the raw value (not expanded) to avoid resolving unanswerable drive
+         # refs during --validate without an answers file.
+         local _tok _arr=()
+         read -ra _arr <<< "$vdev_val"
+         for _tok in "${_arr[@]}"; do
+            if is_crypt_ref "$_tok"; then
+               validate_crypt_reference "$section" "$_tok" || ((valid++))
+            fi
+         done
       fi
    fi
 
@@ -1957,8 +1976,49 @@ validate_target_reference() {
    return $valid
 }
 
+# Validate that a 'crypt.<instance>' token refers to an existing
+# [action.crypt.<instance>] section. Prints an error and returns 1 if the
+# referenced crypt instance is not defined.
+# Parameters: $1 - section name (for error messages)
+#             $2 - the crypt reference token (e.g. 'crypt.root')
+# Returns: 0 if the instance exists, 1 otherwise
+validate_crypt_reference() {
+   local section="$1" ref="$2"
+   local instance="${ref#crypt.}"
+   local target_section="action.crypt.${instance}"
+   local s found=false
+   for s in "${SECTIONS[@]}"; do
+      if [[ "$s" == "$target_section" ]]; then
+         found=true
+         break
+      fi
+   done
+   if [[ "$found" == false ]]; then
+      printf '%s\n' "error: [${section}] crypt reference '${ref}' does not match" \
+         "any [action.crypt.*] section" >&2
+      return 1
+   fi
+   return 0
+}
+
+# Detect a crypt back-reference token. A token is a crypt reference when it
+# starts with the literal 'crypt.' prefix (it is never a %variable% — those
+# are expanded before this check — nor a /dev/ path).
+# Parameters: $1 - token to test
+# Returns: 0 if the token is a 'crypt.<instance>' reference, 1 otherwise
+is_crypt_ref() {
+   [[ "$1" == crypt.* ]]
+}
+
+# Extract the instance name from a 'crypt.<instance>' token.
+# Parameters: $1 - crypt reference token
+# Prints: the instance name (everything after 'crypt.')
+crypt_ref_instance() {
+   printf '%s' "${1#crypt.}"
+}
+
 # Validate that a drive key in a section references a valid drives variable
-# or is a literal device path (e.g. /dev/sda1).
+# or a literal device path (e.g. /dev/sda1).
 # Parameters: $1 - section name
 #             $2 - key name (e.g. "drive")
 #             $3 - optional: "require_partition" to require a partition number
@@ -1987,6 +2047,13 @@ validate_drive_reference() {
                ((valid++))
             fi
          fi
+         return $valid
+      fi
+
+      # Crypt back-reference (crypt.<instance>) — the mapper device is
+      # always whole-device, so the partition requirement does not apply.
+      if is_crypt_ref "$val"; then
+         validate_crypt_reference "$section" "$val" || ((valid++))
          return $valid
       fi
 
@@ -2110,6 +2177,18 @@ check_drive_ref_exists() {
    local drive_val="$1"
    local error_section="$2"
    local mode="${3:-}"
+
+   # Crypt back-reference: the mapper device is created at runtime by an
+   # earlier action.crypt step, so it cannot be verified at sanity-check
+   # time (before any action runs). Treat it as an action device and skip.
+   if is_crypt_ref "$drive_val"; then
+      local instance
+      instance="$(crypt_ref_instance "$drive_val")"
+      if [[ -n "${ACTION_DEVICES[/dev/mapper/${instance}]+x}" ]]; then
+         return 0
+      fi
+      return 0
+   fi
 
    # Literal device path — check existence of base device.
    # The partition may not exist yet if created by a later action,
@@ -2346,7 +2425,10 @@ mount_target_filesystem() {
          local drive_ref
          drive_ref="$(get_value "$target_section" "drive")"
          local device
-         expand_value "$drive_ref"; device="$_expand_value_result"
+         resolve_drive_value "$drive_ref"; device="$_resolve_drive_value"
+         local -a _mdevs=()
+         read -ra _mdevs <<< "$device"
+         device="${_mdevs[0]:-}"
          resolved_name="${device}"
          log "  Mounting ${resolved_name} at ${mount_point}"
          run_cmd mount -t ext4 "${device}" "${mount_point}"
@@ -2358,7 +2440,10 @@ mount_target_filesystem() {
          local drive_ref
          drive_ref="$(get_value "$target_section" "drive")"
          local device
-         expand_value "$drive_ref"; device="$_expand_value_result"
+         resolve_drive_value "$drive_ref"; device="$_resolve_drive_value"
+         local -a _mdevs=()
+         read -ra _mdevs <<< "$device"
+         device="${_mdevs[0]:-}"
          resolved_name="${device}"
          log "  Mounting ${resolved_name} at ${mount_point}"
          run_cmd mount -t vfat "${device}" "${mount_point}"
@@ -3051,6 +3136,10 @@ collect_action_devices() {
             fi
             ACTION_DEVICES["$device"]=1
          fi
+      elif [[ "$section" == action.crypt.* ]]; then
+         # The instance name is the mapper name: /dev/mapper/<instance>.
+         local instance="${section#action.crypt.}"
+         ACTION_DEVICES["/dev/mapper/${instance}"]=1
       fi
    done
 }
@@ -3543,6 +3632,9 @@ build_zpool_cmd() {
    local expanded
    expand_value "$vdev_val"; expanded="$_expand_value_result"
    _zpool_vdev_display="$expanded"
+   # Resolve crypt.<instance> back-references (opens the LUKS device on first
+   # use) while preserving the display string above.
+   resolve_drive_value "$vdev_val"; expanded="$_resolve_drive_value"
 
    _cmd_result=(zpool create)
 
@@ -3696,8 +3788,14 @@ run_action_mkfs() {
    local drive_val
    drive_val="$(get_value "$section" "drive")"
    local device
-   expand_value "$drive_val"; device="$_expand_value_result"
-   run_mkfs_command "$section" "$description" "$base_cmd" "$label_flag" "$device"
+   resolve_drive_value "$drive_val"; device="$_resolve_drive_value"
+   # A mkfs 'drive' is a single device; reject a multi-token result.
+   local -a _devs=()
+   read -ra _devs <<< "$device"
+   if [[ ${#_devs[@]} -gt 1 ]]; then
+      die "[${section}] 'drive' must reference a single device, got '${drive_val}'"
+   fi
+   run_mkfs_command "$section" "$description" "$base_cmd" "$label_flag" "${_devs[0]:-}"
 }
 
 run_action_ext4() { run_action_mkfs "$1" "ext4 filesystem" mkfs.ext4 -L; }
@@ -4459,6 +4557,131 @@ run_action_netifrename() {
    log "Network interface rename .link file created: ${orig_name} → ${new_name}"
 }
 
+# --- action.crypt (LUKS) ------------------------------------------------
+
+# Validate an action.crypt section.
+# Required keys: drive (partition or whole-disk ref / literal), passphrase
+# (must contain at least one %variable% reference, like action.password).
+# Optional: options (extra cryptsetup luksFormat args).
+# Parameters: $1 - section name
+# Returns: number of errors found
+validate_action_crypt() {
+   local section="$1"
+   local valid=0
+
+   validate_instance_name "$section" "crypt" || ((valid++))
+
+   validate_drive_reference "$section" "drive" || ((valid++))
+
+   if ! has_key "$section" "passphrase"; then
+      printf '%s\n' "error: [${section}] missing required key 'passphrase'" >&2
+      ((valid++))
+   else
+      # Require at least one variable reference so a literal passphrase is
+      # never stored in the config or written to logs.
+      local passphrase_val refs
+      passphrase_val="$(get_value "$section" "passphrase")"
+      refs="$(extract_references "$passphrase_val")"
+      if [[ -z "$refs" ]]; then
+         printf '%s\n' "error: [${section}] 'passphrase' must reference a userinput variable" \
+            "(e.g. %varname%), got '${passphrase_val}'" >&2
+         ((valid++))
+      else
+         local ref
+         while IFS= read -r ref; do
+            [[ -z "$ref" ]] && continue
+            if ! validate_variable "$ref"; then
+               printf '%s\n' "error: [${section}] 'passphrase' references variable '${ref}'" \
+                  "which is not defined by any [userinput.*] section" >&2
+               ((valid++))
+            fi
+         done <<< "$refs"
+      fi
+   fi
+
+   return $valid
+}
+
+# Runtime sanity check for action.crypt.
+# Verifies cryptsetup is available and the referenced drive exists (or will be
+# created by an earlier action).
+# Parameters: $1 - section name
+# Returns: 0 if ok, 1 if cryptsetup missing or device absent
+sanity_check_crypt() {
+   local section="$1"
+
+   if ! command -v cryptsetup &>/dev/null; then
+      msg_error "cryptsetup is required but not found on this system."
+      return 1
+   fi
+
+   if has_key "$section" "drive"; then
+      local drive_val
+      drive_val="$(get_value "$section" "drive")"
+      check_drive_ref_exists "$drive_val" "$section" || return 1
+   fi
+
+   return 0
+}
+
+# Create a LUKS-encrypted device (cryptsetup luksFormat). The device is NOT
+# opened here; it is opened lazily by ensure_crypt_open the first time a later
+# action references it via a crypt.<instance> back-reference.
+# Parameters: $1 - section name
+run_action_crypt() {
+   local section="$1"
+   local instance_name="${section#action.crypt.}"
+   if [[ "$instance_name" == "$section" ]]; then
+      die "[${section}] has no instance name"
+   fi
+
+   if ! has_key "$section" "drive"; then
+      die "[${section}] missing required key 'drive'"
+   fi
+   if ! has_key "$section" "passphrase"; then
+      die "[${section}] missing required key 'passphrase'"
+   fi
+
+   local drive_val passphrase_val drive passphrase
+   drive_val="$(get_value "$section" "drive")"
+   passphrase_val="$(get_value "$section" "passphrase")"
+   # Resolve drive (no crypt nesting expected, but reuse the helper anyway).
+   resolve_drive_value "$drive_val"; drive="$_resolve_drive_value"
+   local -a _d=()
+   read -ra _d <<< "$drive"
+   drive="${_d[0]:-}"
+   if [[ -z "$drive" ]]; then
+      die "[${section}] 'drive' resolves to an empty device path"
+   fi
+   expand_value "$passphrase_val"; passphrase="$_expand_value_result"
+   if [[ -z "$passphrase" ]]; then
+      die "[${section}] 'passphrase' resolves to an empty value"
+   fi
+
+   # Feed the passphrase via a temp key-file so it never appears in argv.
+   local keyfile
+   keyfile="$(mktemp)"
+   TEMP_FILES+=("$keyfile")
+   chmod 600 "$keyfile"
+   printf '%s' "$passphrase" > "$keyfile"
+
+   local -a cmd=(cryptsetup luksFormat --key-file "$keyfile")
+   if has_key "$section" "options"; then
+      local options
+      options="$(get_value "$section" "options")"
+      local -a opts=()
+      read -ra opts <<< "$options"
+      cmd+=("${opts[@]}")
+   fi
+   cmd+=("$drive")
+
+   log "Creating LUKS device '${instance_name}' on ${drive}"
+   log "  Command: ${cmd[*]}"
+   run_cmd --stdin /dev/null -- "${cmd[@]}"
+
+   log "LUKS device '${instance_name}' created (not opened)."
+}
+
 # Validate an md action section has required keys.
 # Parameters: $1 - section name
 # Returns: number of errors found
@@ -4524,6 +4747,17 @@ validate_action_md() {
             ((valid++))
          fi
       done <<< "$refs"
+
+      # Validate crypt.<instance> back-reference tokens (literal, not %...%).
+      # Scan the raw value to avoid resolving unanswerable drive refs during
+      # --validate without an answers file.
+      local _tok _arr=()
+      read -ra _arr <<< "$drives_val"
+      for _tok in "${_arr[@]}"; do
+         if is_crypt_ref "$_tok"; then
+            validate_crypt_reference "$section" "$_tok" || ((valid++))
+         fi
+      done
    fi
 
    return $valid
@@ -4569,6 +4803,11 @@ sanity_check_md() {
 
    for device in "${devices[@]}"; do
       [[ "$device" == "missing" ]] && continue
+      # crypt.<instance> back-reference: the mapper is created at runtime by
+      # an earlier action.crypt step; skip the existence check.
+      if is_crypt_ref "$device"; then
+         continue
+      fi
       if [[ ! -e "$device" ]]; then
          if is_action_device "$device"; then
             : # Skip check — device will be created by an action
@@ -4626,9 +4865,12 @@ build_md_cmd() {
 
    local expanded
    expand_value "$drives_val"; expanded="$_expand_value_result"
+   _md_drives_display="$expanded"
+   # Resolve crypt.<instance> back-references (opens the LUKS device on first
+   # use) while preserving the display string above.
+   resolve_drive_value "$drives_val"; expanded="$_resolve_drive_value"
    local -a devices=()
    read -ra devices <<< "$expanded"
-   _md_drives_display="$expanded"
 
    _cmd_result=(mdadm --create "/dev/${_md_device}" \
       --level="${_md_level}" --raid-devices="${_md_numdevices}" \
@@ -4753,6 +4995,183 @@ run_action_mdadm() {
       || die "[${section}] failed to create mdadm.conf"
 
    log "mdadm.conf created successfully."
+}
+
+# --- action.crypttab -----------------------------------------------------
+
+# Validate an action.crypttab section.
+# Required keys: target (root filesystem target ref), drives (space-separated
+# list of crypt.<instance> back-references).
+# Optional: remember (true|false, default false).
+# Parameters: $1 - section name
+# Returns: number of errors found
+validate_action_crypttab() {
+   local section="$1"
+   local valid=0
+
+   validate_instance_name "$section" "crypttab" || ((valid++))
+
+   validate_target_reference "$section" || ((valid++))
+
+   if ! has_key "$section" "drives"; then
+      printf '%s\n' "error: [${section}] missing required key 'drives'" >&2
+      ((valid++))
+   else
+      local drives_val _tok _arr=()
+      drives_val="$(get_value "$section" "drives")"
+      # Scan the raw value: drives entries are literal crypt.<instance> tokens
+      # (no %...% references), and expanding would die on unanswerable refs.
+      read -ra _arr <<< "$drives_val"
+      local _saw_one=false
+      for _tok in "${_arr[@]}"; do
+         _saw_one=true
+         if is_crypt_ref "$_tok"; then
+            validate_crypt_reference "$section" "$_tok" || ((valid++))
+         else
+            printf '%s\n' "error: [${section}] 'drives' entry '${_tok}' is not a crypt reference" \
+               "(expected crypt.<instance>)" >&2
+            ((valid++))
+         fi
+      done
+      if [[ "$_saw_one" == false ]]; then
+         printf '%s\n' "error: [${section}] 'drives' must list at least one crypt.<instance>" \
+            >&2
+         ((valid++))
+      fi
+   fi
+
+   if has_key "$section" "remember"; then
+      local remember
+      remember="$(get_value "$section" "remember")"
+      if [[ "$remember" != "true" && "$remember" != "false" ]]; then
+         printf '%s\n' "error: [${section}] 'remember' must be 'true' or 'false'," \
+            "got '${remember}'" >&2
+         ((valid++))
+      fi
+   fi
+
+   return $valid
+}
+
+# Runtime sanity check for action.crypttab.
+# Verifies cryptsetup/blkid availability and the target filesystem.
+# Parameters: $1 - section name
+# Returns: 0 if ok, 1 if dependencies missing or target unavailable
+sanity_check_crypttab() {
+   local section="$1"
+
+   if ! command -v cryptsetup &>/dev/null; then
+      msg_error "cryptsetup is required but not found on this system."
+      return 1
+   fi
+   if ! command -v blkid &>/dev/null; then
+      msg_error "blkid is required but not found on this system."
+      return 1
+   fi
+
+   if has_key "$section" "target"; then
+      local target
+      target="$(get_value "$section" "target")"
+      sanity_check_target_filesystem "$target" "$section" || return 1
+   fi
+
+   return 0
+}
+
+# Callback body for run_action_crypttab via with_target_mount.
+# Writes /etc/crypttab with one line per crypt instance:
+#   <instance>  UUID=<uuid>  none  <options>
+# where <options> is 'luks,discard' (remember=false) or
+# 'luks,discard,initramfs,keyscript=decrypt_keyctl' (remember=true).
+# Parameters: $1 mount_point, $2 resolved_name, $3 target_type, $4 section
+_do_crypttab() {
+   local mount_point="$1" resolved_name="$2" target_type="$3" section="$4"
+
+   local etc_dir="${mount_point}/etc"
+   log "  Ensuring ${etc_dir} exists"
+   mkdir -p "$etc_dir" || die "[${section}] failed to create ${etc_dir}"
+
+   local crypttab_file="${etc_dir}/crypttab"
+   log "  Writing ${crypttab_file}"
+
+   local remember=false
+   if has_key "$section" "remember"; then
+      remember="$(get_value "$section" "remember")"
+   fi
+   local options
+   if [[ "$remember" == "true" ]]; then
+      options="luks,discard,initramfs,keyscript=decrypt_keyctl"
+   else
+      options="luks,discard"
+   fi
+
+   local drives_val _tok _arr=() _exp
+   drives_val="$(get_value "$section" "drives")"
+   expand_value "$drives_val"; _exp="$_expand_value_result"
+   read -ra _arr <<< "$_exp"
+
+   local tmpfile
+   tmpfile="$(mktemp)"
+   TEMP_FILES+=("$tmpfile")
+
+   for _tok in "${_arr[@]}"; do
+      if ! is_crypt_ref "$_tok"; then
+         rm -f "$tmpfile"
+         die "[${section}] 'drives' entry '${_tok}' is not a crypt reference"
+      fi
+      local instance
+      instance="$(crypt_ref_instance "$_tok")"
+      local crypt_section="action.crypt.${instance}"
+      if ! has_key "$crypt_section" "drive"; then
+         rm -f "$tmpfile"
+         die "[${section}] crypt instance '${instance}' has no 'drive' key"
+      fi
+      local cdrive_val cdrive uuid
+      cdrive_val="$(get_value "$crypt_section" "drive")"
+      expand_value "$cdrive_val"; cdrive="$_expand_value_result"
+      local -a _cd=()
+      read -ra _cd <<< "$cdrive"
+      cdrive="${_cd[0]:-}"
+      if [[ -z "$cdrive" ]]; then
+         rm -f "$tmpfile"
+         die "[${section}] crypt instance '${instance}' 'drive' is empty"
+      fi
+      uuid="$(blkid -s UUID -o value "$cdrive" 2>/dev/null)"
+      if [[ -z "$uuid" ]]; then
+         rm -f "$tmpfile"
+         die "[${section}] could not determine UUID for '${cdrive}'" \
+            "(crypt instance '${instance}')"
+      fi
+      printf '%s\n' "${instance} UUID=${uuid} none ${options}" >> "$tmpfile"
+      log "    ${instance} UUID=${uuid} none ${options}"
+   done
+
+   if ! mv "$tmpfile" "$crypttab_file"; then
+      rm -f "$tmpfile"
+      die "[${section}] failed to write ${crypttab_file}"
+   fi
+   chmod 644 "$crypttab_file" 2>/dev/null || true
+}
+
+# Write /etc/crypttab onto a target filesystem.
+# Parameters: $1 - section name
+run_action_crypttab() {
+   local section="$1"
+   local instance_name="${section#action.crypttab.}"
+   if [[ "$instance_name" == "$section" ]]; then
+      die "[${section}] has no instance name"
+   fi
+
+   if ! has_key "$section" "target"; then
+      die "[${section}] missing required key 'target'"
+   fi
+   local target
+   target="$(get_value "$section" "target")"
+
+   with_target_mount "$section" "$target" "Writing /etc/crypttab on" _do_crypttab \
+      || die "[${section}] failed to write /etc/crypttab"
+
+   log "/etc/crypttab created successfully."
 }
 
 # Validate an updateinitramfs action section.
@@ -5212,6 +5631,12 @@ run_action_efibootmgr() {
             die "[${section}] 'drive' literal path '${drive_val}' does not include a partition number"
          fi
          drives+=("$(strip_partition "$drive_val")")
+      elif is_crypt_ref "$drive_val"; then
+         # A LUKS mapper is a whole device with no partition number.
+         local _mapper
+         _mapper="$(resolve_device_token "$drive_val")"
+         partnum=""
+         drives+=("$_mapper")
       else
          local ref
          ref="$(parse_single_reference "$drive_val")" || \
@@ -5267,10 +5692,17 @@ run_action_efibootmgr() {
       expand_value "$label_template"; label="$_expand_value_result"
       expand_value "$efi_path_template"; efi_path="$_expand_value_result"
 
-      local -a cmd=(efibootmgr --create --label "$label" --disk "$base_dev" --part "$partnum" \
-         --loader "$efi_path")
+      local -a cmd=(efibootmgr --create --label "$label" --disk "$base_dev")
+      if [[ -n "$partnum" ]]; then
+         cmd+=(--part "$partnum")
+      fi
+      cmd+=(--loader "$efi_path")
 
-      log "Creating EFI boot entry '${label}' on ${base_dev} partition ${partnum}"
+      if [[ -n "$partnum" ]]; then
+         log "Creating EFI boot entry '${label}' on ${base_dev} partition ${partnum}"
+      else
+         log "Creating EFI boot entry '${label}' on ${base_dev}"
+      fi
       log "  Command: ${cmd[*]}"
       run_cmd "${cmd[@]}"
    done
@@ -5939,6 +6371,137 @@ run_actions_with_progress() {
    done
 }
 
+# --- LUKS / crypt helpers ------------------------------------------------
+
+# Open a crypt instance (cryptsetup luksOpen) if it is not already open.
+# Idempotent: once opened the instance stays open for the rest of the run
+# and is closed on exit by close_created_crypt_devices (mirroring how MD
+# arrays created by action.md are kept assembled until exit).
+# The passphrase and underlying device are read from the matching
+# [action.crypt.<instance>] section. The passphrase is fed to cryptsetup via
+# a temporary key-file (mode 0600) so it never appears in argv or logs.
+# Parameters: $1 - crypt instance name
+# Returns: 0 on success, dies on failure
+ensure_crypt_open() {
+   local instance="$1"
+   local mapper="/dev/mapper/${instance}"
+
+   # Already open (e.g. by an earlier action in this run).
+   if [[ -e "$mapper" ]]; then
+      return 0
+   fi
+   # Defensive guard against re-entry while a failed open is being retried.
+   if [[ -n "${OPENED_CRYPT[$instance]+x}" ]]; then
+      return 0
+   fi
+
+   local section="action.crypt.${instance}"
+   local s found=false
+   for s in "${SECTIONS[@]}"; do
+      [[ "$s" == "$section" ]] && { found=true; break; }
+   done
+   if [[ "$found" == false ]]; then
+      die "crypt instance '${instance}' is not defined by any [action.crypt.*] section"
+   fi
+
+   if ! has_key "$section" "drive"; then
+      die "[${section}] missing required key 'drive'"
+   fi
+   if ! has_key "$section" "passphrase"; then
+      die "[${section}] missing required key 'passphrase'"
+   fi
+
+   local drive_val passphrase_val drive passphrase
+   drive_val="$(get_value "$section" "drive")"
+   passphrase_val="$(get_value "$section" "passphrase")"
+   expand_value "$drive_val"; drive="$_expand_value_result"
+   expand_value "$passphrase_val"; passphrase="$_expand_value_result"
+
+   if [[ -z "$drive" ]]; then
+      die "[${section}] 'drive' resolves to an empty device path"
+   fi
+   if [[ -z "$passphrase" ]]; then
+      die "[${section}] 'passphrase' resolves to an empty value"
+   fi
+
+   # Write the passphrase to a temp key-file without a trailing newline so
+   # cryptsetup reads it verbatim via --key-file.
+   local keyfile
+   keyfile="$(mktemp)"
+   TEMP_FILES+=("$keyfile")
+   chmod 600 "$keyfile"
+   printf '%s' "$passphrase" > "$keyfile"
+
+   log "Opening LUKS device '${instance}' (${drive})"
+   run_cmd --stdin /dev/null -- cryptsetup luksOpen --key-file "$keyfile" \
+      "$drive" "$instance"
+
+   OPENED_CRYPT["$instance"]=1
+   CREATED_CRYPT_DEVICES+=("$instance")
+}
+
+# Resolve a single device token to a device path. If the token is a
+# 'crypt.<instance>' back-reference, the instance is opened (idempotently)
+# and the mapper path /dev/mapper/<instance> is returned; otherwise the
+# token is returned unchanged.
+# Parameters: $1 - token (already %variable%-expanded)
+# Prints: resolved device path
+resolve_device_token() {
+   local token="$1"
+   if is_crypt_ref "$token"; then
+      local instance
+      instance="$(crypt_ref_instance "$token")"
+      ensure_crypt_open "$instance"
+      printf '%s' "/dev/mapper/${instance}"
+   else
+      printf '%s' "$token"
+   fi
+}
+
+# Expand %variable% references in a drive value and resolve every resulting
+# token, opening any crypt.<instance> back-references as needed. Returns the
+# resolved device list as a space-separated string via _resolve_drive_value.
+# This is the single hook all drive-keyed actions (ext4/vfat/swap/md/zpool/
+# efibootmgr) use, so LUKS handling lives in exactly one place.
+# Parameters: $1 - raw drive value (e.g. "%drives[0]2% crypt.root")
+# Sets _resolve_drive_value with the resolved device list.
+resolve_drive_value() {
+   local raw="$1"
+   local expanded
+   expand_value "$raw"; expanded="$_expand_value_result"
+   local -a tokens=() out=()
+   read -ra tokens <<< "$expanded"
+   local t
+   for t in "${tokens[@]}"; do
+      out+=("$(resolve_device_token "$t")")
+   done
+   _resolve_drive_value="${out[*]}"
+}
+
+# Close every LUKS instance opened during this run. Mirror of
+# stop_created_md_devices; called from run_done_action on reboot/poweroff.
+# Returns: 0 if all closed (or cryptsetup absent), 1 if any failed
+close_created_crypt_devices() {
+   if [[ ${#CREATED_CRYPT_DEVICES[@]} -eq 0 ]]; then
+      return 0
+   fi
+   if ! command -v cryptsetup &>/dev/null; then
+      return 0
+   fi
+
+   local failed=0 instance
+   for instance in "${CREATED_CRYPT_DEVICES[@]}"; do
+      if [[ -e "/dev/mapper/${instance}" ]]; then
+         log "Closing LUKS device ${instance}..."
+         if ! cryptsetup luksClose "$instance" 2>/dev/null; then
+            log "WARNING: failed to close LUKS device ${instance}"
+            failed=1
+         fi
+      fi
+   done
+   return $failed
+}
+
 # Resolve a drive reference (varname[idx]part) to a device path.
 # Parameters: $1 - reference string (e.g. drives[0]3)
 # Sets _resolve_result with the device path.
@@ -6555,12 +7118,14 @@ run_done_action() {
          log "Rebooting system..."
          export_imported_zpools || true
          stop_created_md_devices || true
+         close_created_crypt_devices || true
          reboot -f
          ;;
       poweroff)
          log "Powering off system..."
          export_imported_zpools || true
          stop_created_md_devices || true
+         close_created_crypt_devices || true
          poweroff -f
          ;;
       wait)
@@ -6727,7 +7292,7 @@ main() {
    readonly VALIDATE_ONLY UNATTENDED
 
    # --- Set up logging (before any execution that may call die/log) ---
-   LOG_FILE="${TMPDIR:-/tmp}/jumpstart-$(date '+%Y%m%d-%H%M%S').log"
+   LOG_FILE="${TMPDIR:-/tmp}/jump-$(date '+%Y%m%d-%H%M%S').log"
    readonly LOG_FILE
    trap cleanup EXIT
    # In unattended mode, keep the log file after exit for diagnostics.
