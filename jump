@@ -5664,9 +5664,11 @@ run_action_updateinitramfs() {
       die "[${section}] failed to bind-mount /dev"
    fi
 
-   # Run update-initramfs inside the chroot
+   # Run update-initramfs inside the chroot. Route through run_cmd so its
+   # output goes to the log (not the terminal/progress window), like every
+   # other command.
    log "  Running: chroot ${mount_point} update-initramfs -u -k all"
-   if ! chroot "$mount_point" update-initramfs -u -k all; then
+   if ! run_cmd --allow-fail chroot "$mount_point" update-initramfs -u -k all; then
       unmount_chroot_stack "$mount_point" "${bind_mounts[@]}"
       die "[${section}] update-initramfs failed"
    fi
