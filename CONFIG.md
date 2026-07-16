@@ -134,13 +134,34 @@ variable.
 
 | Key    | Required | Description                       |
 | ------ | -------- | --------------------------------- |
-| `value` | yes      | The variable's value. May contain `%othervar%` references (forward references allowed) and built-in references. |
+| `value` | yes*     | The variable's value (the `when`-true branch). May contain `%othervar%` references (forward references allowed) and built-in references. |
+| `when`  | no       | Optional predicate (same grammar as the action `when` key): when true the variable takes `value`; when false it takes `else` (or is left undefined if `else` is absent). |
+| `else`  | no       | The variable's value when `when` is false. If `when` is false and `else` is absent, the variable is not defined this run. |
+
+*`value` is required unless the variable is being skipped (`when` false, no `else`). The `when` predicate may be static (`type:<type>`, `section:<name>`, `true`/`false`) or may reference another `[var.*]` defined earlier in the config (e.g. `when = %luks%` for a per-host flag); such variable references are resolved iteratively. It must **not** reference a `userinput` answer, which is not yet known at variable-resolution time.
+
+This lets a single variable pick a value per host variant without duplicating sections (which the INI parser would merge). For example, choosing a zpool vdev depending on whether LUKS was set up:
+
+```ini
+[var.zpoolvdev]
+when  = type:crypt
+value = /dev/mapper/luks
+else  = %drives[0]3%
+
+[action.zpool.main]
+vdev = %zpoolvdev%
+```
 
 Action sections may also define variables locally with `var.<name> = value`
 keys (or, for backward compatibility, the legacy `var = name:value` shorthand).
 These are collected together with `[var.*]` sections and removed from the
 config before validation, so they are available as `%name%` everywhere but are
-not passed to the action as a normal key.
+not passed to the action as a normal key. Action-local variables are only
+collected from **active** actions (those whose `when` is true/absent), so two
+mutually-exclusive conditional actions may each define the same `var.<name>`
+— only the active one's value is used. The action `when` may reference a
+`[var.*]` defined earlier (resolved iteratively), but not a `userinput`
+answer (not yet known at variable-resolution time).
 
 ### Example
 

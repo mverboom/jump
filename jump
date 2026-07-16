@@ -587,34 +587,73 @@ process_user_vars() {
    local -A user_vars=()
    local -a var_sections=()
    local -a action_var_keys=()
-   local section var_name var_value key
+   local section var_name key
 
-   # Collect var definitions from [var.name] sections.
+   # Deferred-resolution bookkeeping (populated in Phase 1, resolved in
+   # Phase 2 once the variables their `when` references are known, so a
+   # `when = %othervar%` works for variables defined earlier in the config).
+   # Conditional [var.*]: var_name -> when / value / else (+ has_* flags).
+   local -A pend_var_when=() pend_var_value=() pend_var_else=()
+   local -A pend_var_has_value=() pend_var_has_else=()
+   local -a pend_var_order=()
+   # Action sections carrying var.<name> (or legacy var): section -> when;
+   # section -> "\x1f"-separated "name=value" records.
+   local -a pend_act_sections=()
+   local -A pend_act_when=() pend_act_vars=() pend_act_done=()
+   local -A pend_var_done=()
+
+   # --- Phase 1: collect raw definitions (nothing resolved yet) ----------
    for section in "${SECTIONS[@]}"; do
       if [[ "$section" == var.* ]]; then
          var_name="${section#var.}"
-
          validate_variable_name "$var_name" "[${section}]"
-
-         # Check for duplicate var sections
-         if [[ -n "${user_vars[$var_name]+x}" ]]; then
-            die "duplicate variable definition '${var_name}' in [${section}]"
-         fi
-
-         # Check for required 'value' key
-         if ! has_key "$section" "value"; then
-            die "[${section}] missing required key 'value'"
-         fi
-
-         var_value="$(get_value "$section" "value")"
-         user_vars["$var_name"]="$var_value"
          var_sections+=("$section")
+
+         if has_key "$section" "when"; then
+            # Conditional: defer resolution to Phase 2.
+            pend_var_when["$var_name"]="$(get_value "$section" "when")"
+            if has_key "$section" "value"; then
+               pend_var_has_value["$var_name"]=1
+               pend_var_value["$var_name"]="$(get_value "$section" "value")"
+            else
+               pend_var_has_value["$var_name"]=0
+               pend_var_value["$var_name"]=""
+            fi
+            if has_key "$section" "else"; then
+               pend_var_has_else["$var_name"]=1
+               pend_var_else["$var_name"]="$(get_value "$section" "else")"
+            else
+               pend_var_has_else["$var_name"]=0
+            fi
+            pend_var_order+=("$var_name")
+         else
+            # Unconditional: define now (value required).
+            if ! has_key "$section" "value"; then
+               die "[${section}] missing required key 'value'"
+            fi
+            if [[ -n "${user_vars[$var_name]+x}" ]]; then
+               die "duplicate variable definition '${var_name}' in [${section}]"
+            fi
+            user_vars["$var_name"]="$(get_value "$section" "value")"
+         fi
       fi
    done
 
-   # Collect var definitions from action sections (var.<name> = value).
+   # Collect var definitions from action sections (var.<name> = value and
+   # legacy var = name:value). The action's optional `when` gates whether its
+   # variables are defined; because that `when` may reference other variables
+   # (e.g. %luks%), resolution is deferred to Phase 2 (after those vars are
+   # known). The var.<name> keys are always queued for removal from CONFIG.
    for section in "${SECTIONS[@]}"; do
       [[ "$section" == action.* ]] || continue
+
+      local act_when=""
+      if has_key "$section" "when"; then
+         act_when="$(get_value "$section" "when")"
+      fi
+
+      local act_recs=""
+      local has_act_var=false
 
       for key in "${!CONFIG[@]}"; do
          local key_section="${key%%:*}"
@@ -628,28 +667,21 @@ process_user_vars() {
 
          validate_variable_name "$var_name" "${key_name} in [${section}]"
 
-         # Check for duplicate var definitions
-         if [[ -n "${user_vars[$var_name]+x}" ]]; then
-            die "duplicate variable definition '${var_name}' in [${section}]"
-         fi
-
-         # Check for duplicate var.<name> keys within this action section
+         # Duplicate var.<name> key within this action section is a structural
+         # error regardless of whether the action is active.
          if [[ -n "${DUPLICATE_KEYS[$key]+x}" ]]; then
             die "duplicate variable definition '${key_name}' in [${section}]"
          fi
 
-         var_value="${CONFIG[$key]}"
-         user_vars["$var_name"]="$var_value"
          action_var_keys+=("$key")
+         has_act_var=true
+         act_recs+="${var_name}=${CONFIG[$key]}"$'\x1f'
       done
 
-      # Collect legacy-style var definitions (var = name:value).
-      # This is an older shorthand supported for compatibility with
-      # recipes that predate the var.<name> syntax.
+      # Legacy-style var definitions (var = name:value).
       local legacy_var_key="${section}:var"
       if [[ -n "${CONFIG[$legacy_var_key]+x}" ]]; then
          local legacy_value="${CONFIG[$legacy_var_key]}"
-         # Split on the first colon: name:value
          if [[ "$legacy_value" == *:* ]]; then
             local legacy_var_name="${legacy_value%%:*}"
             local legacy_var_value="${legacy_value#*:}"
@@ -659,35 +691,46 @@ process_user_vars() {
             [[ -n "$legacy_var_name" ]] || die "empty variable name in 'var = ${legacy_value}' in [${section}]"
             validate_variable_name "$legacy_var_name" "var in [${section}]"
 
-            if [[ -n "${user_vars[$legacy_var_name]+x}" ]]; then
-               die "duplicate variable definition '${legacy_var_name}' in [${section}]"
-            fi
-
-            # Check for duplicate 'var' keys within this action section
             if [[ -n "${DUPLICATE_KEYS[$legacy_var_key]+x}" ]]; then
                die "duplicate variable definition 'var' in [${section}]"
             fi
 
-            user_vars["$legacy_var_name"]="$legacy_var_value"
             action_var_keys+=("$legacy_var_key")
+            has_act_var=true
+            act_recs+="${legacy_var_name}=${legacy_var_value}"$'\x1f'
          fi
+      fi
+
+      if [[ "$has_act_var" == true ]]; then
+         pend_act_sections+=("$section")
+         pend_act_when["$section"]="$act_when"
+         pend_act_vars["$section"]="$act_recs"
       fi
    done
 
-   # If no var definitions, nothing to do
-   if [[ ${#user_vars[@]} -eq 0 ]]; then
+   # If there were no var sections and no action-local var keys, nothing
+   # to do. (user_vars may be empty even when var_sections/action_var_keys
+   # are non-empty — e.g. all vars skipped by when=false — in which case we
+   # still need to run the cleanup below.)
+   if [[ ${#var_sections[@]} -eq 0 ]] && [[ ${#action_var_keys[@]} -eq 0 ]]; then
       return 0
    fi
 
-   # Iteratively expand var values that reference other vars.
-   # Supports forward references (vars defined later in the config).
-   # Detects circular references by limiting iterations.
+   # --- Phase 2: iterative resolution ----------------------------------
+   # Each pass: (a) expand already-defined var values (resolving %var%
+   # references, including forward refs); (b) resolve deferred conditional
+   # [var.*] whose `when` can now be evaluated against the resolved vars;
+   # (c) resolve deferred action-local vars whose action `when` can now be
+   # evaluated. Repeat until stable. This lets `when = %othervar%` work for
+   # variables defined earlier in the config (e.g. a per-host flag).
    local changed=true
    local iteration=0
-   local max_iterations=100
+   local max_iterations=200
    while [[ "$changed" == "true" ]] && [[ $iteration -lt $max_iterations ]]; do
       changed=false
       iteration=$((iteration + 1))
+
+      # (a) expand defined var values
       for var_name in "${!user_vars[@]}"; do
          local old_value="${user_vars[$var_name]}"
          _expand_vars_in_string "$old_value" user_vars
@@ -696,6 +739,69 @@ process_user_vars() {
             user_vars["$var_name"]="$new_value"
             changed=true
          fi
+      done
+
+      # (b) resolve deferred conditional [var.*]
+      local pn
+      for pn in "${pend_var_order[@]}"; do
+         [[ -z "$pn" ]] && continue
+         [[ -n "${pend_var_done[$pn]+x}" ]] && continue
+         [[ -n "${user_vars[$pn]+x}" ]] && { pend_var_done["$pn"]=1; continue; }
+         local when_raw="${pend_var_when[$pn]}"
+         _expand_vars_in_string "$when_raw" user_vars
+         local when_exp="$_expand_vars_result"
+         # If `when` still references an unresolved var, wait for a later pass.
+         [[ "$when_exp" == *%* ]] && continue
+         pend_var_done["$pn"]=1
+         local eff_value=""
+         if eval_when_predicate "$when_exp"; then
+            if [[ "${pend_var_has_value[$pn]}" != "1" ]]; then
+               die "[var.${pn}] missing required key 'value' (when=true branch)"
+            fi
+            eff_value="${pend_var_value[$pn]}"
+         elif [[ "${pend_var_has_else[$pn]}" == "1" ]]; then
+            eff_value="${pend_var_else[$pn]}"
+         else
+            # false branch, no else: variable left undefined this run.
+            continue
+         fi
+         if [[ -n "${user_vars[$pn]+x}" ]]; then
+            die "duplicate variable definition '${pn}' in [var.${pn}]"
+         fi
+         user_vars["$pn"]="$eff_value"
+         changed=true
+      done
+
+      # (c) resolve deferred action-local vars (gated by the action `when`).
+      local asec
+      for asec in "${pend_act_sections[@]}"; do
+         [[ -z "$asec" ]] && continue
+         [[ -n "${pend_act_done[$asec]+x}" ]] && continue
+         local aw="${pend_act_when[$asec]}"
+         local active=true
+         if [[ -n "$aw" ]]; then
+            _expand_vars_in_string "$aw" user_vars
+            local aw_exp="$_expand_vars_result"
+            # If `when` still references an unresolved var, wait.
+            [[ "$aw_exp" == *%* ]] && continue
+            eval_when_predicate "$aw_exp" || active=false
+         fi
+         pend_act_done["$asec"]=1
+         [[ "$active" == true ]] || continue
+         # Define this action's variables.
+         local -a act_recs=()
+         IFS=$'\x1f' read -ra act_recs <<< "${pend_act_vars[$asec]}"
+         local rec
+         for rec in "${act_recs[@]}"; do
+            [[ -z "$rec" ]] && continue
+            local avn="${rec%%=*}"
+            local avv="${rec#*=}"
+            if [[ -n "${user_vars[$avn]+x}" ]]; then
+               die "duplicate variable definition '${avn}' in [${asec}]"
+            fi
+            user_vars["$avn"]="$avv"
+            changed=true
+         done
       done
    done
 
