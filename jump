@@ -4708,7 +4708,6 @@ _do_netifrename() {
    if ! cat > "$link_file" <<-EOF
 		[Match]
 		MACAddress=${mac_addr}
-		OriginalName=${orig_name}
 
 		[Link]
 		Name=${new_name}
